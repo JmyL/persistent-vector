@@ -2,7 +2,6 @@
 #include <iostream>
 #include <string>
 
-
 /**
  * Persistent vector implementation.
  */
@@ -37,11 +36,18 @@ private:
 
 std::size_t errors = 0;
 
-#define ERROR(msg) { \
-    std::cout << __FILE__ << ":" << __LINE__ << " " << msg << "\n"; \
-    ++errors; \
-}
-#define CHECK(x) do if (!(x)) { ERROR(#x " failed"); } while (false)
+#define ERROR(msg)                                                      \
+    {                                                                   \
+        std::cout << __FILE__ << ":" << __LINE__ << " " << msg << "\n"; \
+        ++errors;                                                       \
+    }
+#define CHECK(x)                 \
+    do                           \
+        if (!(x))                \
+        {                        \
+            ERROR(#x " failed"); \
+        }                        \
+    while (false)
 
 constexpr unsigned LOOP_COUNT = 100000;
 
