@@ -1,32 +1,47 @@
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <condition_variable>
-#include <fcntl.h> // for open()
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
-#include <fstream> // for ifstream
+#include <fstream>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unistd.h> // for fsync()
 #include <utility>
 #include <vector>
 
-#include "lockfree_queue.hh"
+static_assert(sizeof(size_t) == sizeof(uint64_t),
+              "size_t and uint64_t are not the same size!");
 
 constexpr unsigned long long operator"" _KB(unsigned long long num)
 {
     return num * 1024;
 }
 
-uint64_t xor_checksum64(const uint64_t* data, size_t length)
+int GetFileDescriptor(std::filebuf& filebuf)
 {
-    uint64_t checksum = 0;
-    for (size_t i = 0; i < length; ++i)
+    class my_filebuf : public std::filebuf
     {
-        checksum ^= data[i];
-    }
-    return checksum;
+    public:
+        int handle() { return _M_file.fd(); }
+    };
+
+    return static_cast<my_filebuf&>(filebuf).handle();
+}
+
+int GetFileDescriptor(std::ofstream& ofs)
+{
+    return GetFileDescriptor(*ofs.rdbuf());
+}
+
+template <typename T> T pad_to_multiple_of_8(T value)
+{
+    return (value + 7) & ~7;
 }
 
 /**
@@ -36,12 +51,12 @@ class vector
 {
     struct alignas(8) Item
     {
-        std::uint64_t id;
+        uint64_t id;
         std::string str;
         // std::stringstream oss;
 
         template <typename T>
-        Item(std::uint64_t id, T&& str) : id{id}, str{std::forward<T>(str)}
+        Item(uint64_t id, T&& str) : id{id}, str{std::forward<T>(str)}
         {
         }
         Item(const Item&) = default;
@@ -50,139 +65,59 @@ class vector
         Item& operator=(Item&&) = default;
     };
 
-    struct alignas(8) Command
+    struct Header
     {
-        enum class Type
+        uint64_t type;
+        uint64_t id;
+        union
         {
-            None,
-            PushBack,
-            Erase
+            uint64_t dsize;
+            uint64_t rindex;
         };
-        Type type;
-        Item item;
-
-        template <typename T>
-        Command(Type type, T item) : type{type}, item{std::forward<T>(item)}
-        {
-        }
-        Command(const Command&) = default;
-        Command(Command&&) = default;
-        Command& operator=(const Command&) = default;
-        Command& operator=(Command&&) = default;
     };
 
 public:
     /**
      * Create a new vector that can be persistent to `directory`.
      */
-    vector(const std::filesystem::path& directory) : _last_id(0)
+    vector(const std::filesystem::path& directory) : m_last_id(0)
     {
-        _filepath = directory / _filename;
+        m_filepath = directory / _filename;
 
-        if (std::filesystem::exists(_filepath))
+        if (std::filesystem::exists(m_filepath))
         {
-            if (auto _infile = std::ifstream(_filepath, std::ios::binary);
-                !_infile)
-            {
-                throw std::runtime_error("Failed to open " +
-                                         _filepath.string() + " for reading.");
-            }
-            else
-            {
-                // TODO:load file to internal vector, _last_id.
-                // If the file has an error, stop conversion and remove
-                // corrupted information.
-                while (true)
-                {
-                    std::uint64_t id;
-                    _infile.read(reinterpret_cast<char*>(&id), sizeof(id));
-                    if (_infile.eof())
-                    {
-                        break;
-                    }
-                    std::int16_t size;
-                    _infile.read(reinterpret_cast<char*>(&size), sizeof(size));
-                    if (_infile.eof())
-                    {
-                        break;
-                    }
-                    if (size == _tombstone)
-                    {
-                        std::size_t index;
-                        _infile.read(reinterpret_cast<char*>(&index),
-                                     sizeof(index));
-                        if (_infile.eof())
-                        {
-                            break;
-                        }
-                        assert(_data.at(index).id == id);
-                        _data.erase(_data.begin() + index);
-                    }
-                    else
-                    {
-                        std::string str;
-                        str.resize(size);
-                        _infile.read(&str[0],
-                                     size); // 문자열 데이터를 읽어와 저장
-                        if (_infile.eof())
-                        {
-                            break;
-                        }
-                        _data.emplace_back(id, str);
-                    }
-                }
-
-                _infile.close();
-            }
+            load_from_file(m_filepath);
         }
 
-        // if (_file =
-        //         std::ofstream(_filepath, std::ios::binary | std::ios::trunc);
-        //     !_file)
-        if (_file = std::ofstream(_filepath, std::ios::binary | std::ios::app);
-            !_file)
+        m_ofs.open(m_filepath,
+                   std::ios::out | std::ios::binary | std::ios::app);
+
+        if (!m_ofs.is_open())
         {
-            throw std::runtime_error("Failed to open " + _filepath.string() +
+            throw std::runtime_error("Failed to open " + m_filepath.string() +
                                      " for reading.");
         }
-        else
-        {
-        }
 
-        _bg_thread = std::jthread(
+        m_bg_thread = std::jthread(
             [this](std::stop_token stoken)
             {
-                std::unique_lock<std::mutex> lock(mtx); // mutex를 잠금
+                std::mutex mtx;
+                std::unique_lock lock(mtx);
                 while (!stoken.stop_requested())
                 {
-                    // 주기적으로 작업 수행
-                    // T Item;
-                    // if (queue.pop(Item))
-                    // {
-                    //     std::cout << "Processing Item: " << Item <<
-                    //     std::endl;
-                    // }
-                    // else
-                    // {
-                    //     std::this_thread::sleep_for(
-                    //         std::chrono::milliseconds(100)); // 휴식
-                    // }
-
-                    // std::this_thread::sleep_for(
-                    //     std::chrono::seconds(1)); // 휴식
                     cv.wait_for(lock, std::chrono::milliseconds(1000),
                                 [&stoken] { return stoken.stop_requested(); });
+                    m_ofs.flush();
+                    fsync(GetFileDescriptor(m_ofs));
                     std::cout << "thread..." << std::endl;
                 }
             });
     }
     ~vector()
     {
-        _file.close();
-
-        _bg_thread.request_stop();
+        m_bg_thread.request_stop();
         cv.notify_all();
-        _bg_thread.join();
+        m_bg_thread.join();
     }
 
     vector(const vector& v) = delete;
@@ -193,57 +128,96 @@ public:
     {
         if (this != &v)
         {
-            _data = std::exchange(v._data, std::vector<Item>{});
+            m_data = std::exchange(v.m_data, std::vector<Item>{});
         }
         return *this;
     }
 
     void push_back(const std::string& v)
     {
-        std::uint64_t id;
-        id = ++_last_id;
-        _data.emplace_back(id, v);
+        uint64_t id;
+        id = ++m_last_id;
 
-        size_t length = v.size();
+        auto length = v.size();
         assert(length <= 4_KB);
-        assert(length < std::numeric_limits<std::int16_t>::max());
-        // Write, even if size is zero
-        std::int16_t truncated_length = static_cast<std::int16_t>(length);
-        _file.write(reinterpret_cast<const char*>(&id), sizeof(id));
-        _file.write(reinterpret_cast<const char*>(&truncated_length),
-                    sizeof(truncated_length));
-        _file.write(v.data(), truncated_length);
+        {
+            std::lock_guard<std::mutex> lock(m_mtx);
+            auto header = Header{.type = PUSHBACK, .id = id, .dsize = length};
+            m_ofs.write(reinterpret_cast<const char*>(&header), sizeof(header));
+            m_ofs << v;
+        }
+
+        m_data.emplace_back(id, v);
     }
 
     std::string_view at(std::size_t index) const
     {
-        return std::string_view(_data.at(index).str);
+        return std::string_view(m_data.at(index).str);
     }
 
     void erase(std::size_t index)
     {
-        auto it = _data.begin() + index;
+        auto it = m_data.begin() + index;
+        {
+            std::lock_guard<std::mutex> lock(m_mtx);
+            auto header = Header{.type = ERASE, .id = it->id, .rindex = index};
+            m_ofs.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        }
 
-        _file.write(reinterpret_cast<const char*>(&it->id), sizeof(it->id));
-        _file.write(reinterpret_cast<const char*>(&_tombstone),
-                    sizeof(_tombstone));
-        _file.write(reinterpret_cast<const char*>(&index), sizeof(index));
-
-        _data.erase(it);
+        m_data.erase(it);
     }
 
-    std::size_t size() const { return _data.size(); }
+    std::size_t size() const { return m_data.size(); }
 
 private:
+    static constexpr uint64_t PUSHBACK = 1;
+    static constexpr uint64_t ERASE = 2;
     inline static constexpr const char* _filename = ".vector.bin";
-    inline static constexpr const std::int16_t _tombstone = -1;
-    std::vector<Item> _data;
-    std::filesystem::path _filepath;
-    std::ofstream _file;
-    std::uint64_t _last_id;
-    std::jthread _bg_thread;
+    std::vector<Item> m_data;
+    std::filesystem::path m_filepath;
+    std::ofstream m_ofs;
+    std::uint64_t m_last_id;
+    std::jthread m_bg_thread;
     std::condition_variable cv;
-    std::mutex mtx;
+    std::mutex m_mtx;
+
+    void load_from_file(std::filesystem::path& m_filepath)
+    {
+        auto _infile = std::ifstream(m_filepath, std::ios::binary);
+        if (!_infile)
+        {
+            throw std::runtime_error("Failed to open " + m_filepath.string() +
+                                     " for reading.");
+        }
+        // TODO:load file to internal vector, m_last_id.
+        // If the file has an error, stop conversion and remove
+        // corrupted information.
+        while (true)
+        {
+            Header header;
+            _infile.read(reinterpret_cast<char*>(&header), sizeof(header));
+            if (_infile.eof())
+                break;
+
+            if (header.type == ERASE)
+            {
+                assert(m_data.at(header.rindex).id == header.id);
+                m_data.erase(m_data.begin() + header.rindex);
+            }
+            else if (header.type == PUSHBACK)
+            {
+                auto str = std::string();
+                str.resize(header.dsize);
+                _infile.read(reinterpret_cast<char*>(str.data()), header.dsize);
+                if (_infile.eof())
+                    break;
+
+                m_data.emplace_back(header.id, str);
+            }
+
+            _infile.close();
+        }
+    }
 };
 
 std::size_t errors = 0;
@@ -299,6 +273,7 @@ void run_test_one(const std::filesystem::path& p)
     auto end = std::chrono::system_clock::now();
     CHECK((end - start) / 1s < 1);
     CHECK(v.size() == LOOP_COUNT + 2);
+    std::this_thread::sleep_for(1s);
 }
 
 void run_test_two(const std::filesystem::path& p)
@@ -341,9 +316,8 @@ int main(int argc, char**)
     {
         if (std::filesystem::exists(data_dir))
         {
-            std::uintmax_t num_removed = std::filesystem::remove_all(
-                data_dir); // 폴더와 내부 파일 및 하위 디렉토리 삭제
-            std::cout << num_removed << " items removed.\n";
+            std::filesystem::remove_all(data_dir);
+            std::cout << "Directory removed.\n";
         }
         else
         {
