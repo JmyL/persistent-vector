@@ -1,10 +1,13 @@
+#include <atomic>
 #include <cassert>
+#include <condition_variable>
 #include <fcntl.h> // for open()
 #include <filesystem>
 #include <fstream> // for ifstream
 #include <iostream>
 #include <limits>
 #include <string>
+#include <thread>
 #include <unistd.h> // for fsync()
 #include <utility>
 #include <vector>
@@ -31,15 +34,41 @@ uint64_t xor_checksum64(const uint64_t* data, size_t length)
  */
 class vector
 {
-    struct item
+    struct alignas(8) Item
     {
         std::uint64_t id;
         std::string str;
+        // std::stringstream oss;
 
         template <typename T>
-        item(std::uint64_t id, T&& str) : id{id}, str{std::forward<T>(str)}
+        Item(std::uint64_t id, T&& str) : id{id}, str{std::forward<T>(str)}
         {
         }
+        Item(const Item&) = default;
+        Item(Item&&) = default;
+        Item& operator=(const Item&) = default;
+        Item& operator=(Item&&) = default;
+    };
+
+    struct alignas(8) Command
+    {
+        enum class Type
+        {
+            None,
+            PushBack,
+            Erase
+        };
+        Type type;
+        Item item;
+
+        template <typename T>
+        Command(Type type, T item) : type{type}, item{std::forward<T>(item)}
+        {
+        }
+        Command(const Command&) = default;
+        Command(Command&&) = default;
+        Command& operator=(const Command&) = default;
+        Command& operator=(Command&&) = default;
     };
 
 public:
@@ -60,7 +89,7 @@ public:
             }
             else
             {
-                // TODO:load file to internal vector, _last_id and _holes
+                // TODO:load file to internal vector, _last_id.
                 // If the file has an error, stop conversion and remove
                 // corrupted information.
                 while (true)
@@ -87,7 +116,6 @@ public:
                             break;
                         }
                         assert(_data.at(index).id == id);
-                        _holes.push(id);
                         _data.erase(_data.begin() + index);
                     }
                     else
@@ -120,8 +148,42 @@ public:
         else
         {
         }
+
+        _bg_thread = std::jthread(
+            [this](std::stop_token stoken)
+            {
+                std::unique_lock<std::mutex> lock(mtx); // mutex를 잠금
+                while (!stoken.stop_requested())
+                {
+                    // 주기적으로 작업 수행
+                    // T Item;
+                    // if (queue.pop(Item))
+                    // {
+                    //     std::cout << "Processing Item: " << Item <<
+                    //     std::endl;
+                    // }
+                    // else
+                    // {
+                    //     std::this_thread::sleep_for(
+                    //         std::chrono::milliseconds(100)); // 휴식
+                    // }
+
+                    // std::this_thread::sleep_for(
+                    //     std::chrono::seconds(1)); // 휴식
+                    cv.wait_for(lock, std::chrono::milliseconds(1000),
+                                [&stoken] { return stoken.stop_requested(); });
+                    std::cout << "thread..." << std::endl;
+                }
+            });
     }
-    ~vector() { _file.close(); }
+    ~vector()
+    {
+        _file.close();
+
+        _bg_thread.request_stop();
+        cv.notify_all();
+        _bg_thread.join();
+    }
 
     vector(const vector& v) = delete;
     vector& operator=(const vector& v) = delete;
@@ -131,7 +193,7 @@ public:
     {
         if (this != &v)
         {
-            _data = std::exchange(v._data, std::vector<item>{});
+            _data = std::exchange(v._data, std::vector<Item>{});
         }
         return *this;
     }
@@ -139,15 +201,7 @@ public:
     void push_back(const std::string& v)
     {
         std::uint64_t id;
-        if (!_holes.empty())
-        {
-            id = _holes.front();
-            _holes.pop();
-        }
-        else
-        {
-            id = ++_last_id;
-        }
+        id = ++_last_id;
         _data.emplace_back(id, v);
 
         size_t length = v.size();
@@ -169,7 +223,6 @@ public:
     void erase(std::size_t index)
     {
         auto it = _data.begin() + index;
-        _holes.push(it->id);
 
         _file.write(reinterpret_cast<const char*>(&it->id), sizeof(it->id));
         _file.write(reinterpret_cast<const char*>(&_tombstone),
@@ -184,11 +237,13 @@ public:
 private:
     inline static constexpr const char* _filename = ".vector.bin";
     inline static constexpr const std::int16_t _tombstone = -1;
-    std::vector<item> _data;
+    std::vector<Item> _data;
     std::filesystem::path _filepath;
     std::ofstream _file;
     std::uint64_t _last_id;
-    std::queue<size_t> _holes;
+    std::jthread _bg_thread;
+    std::condition_variable cv;
+    std::mutex mtx;
 };
 
 std::size_t errors = 0;
