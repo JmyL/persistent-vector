@@ -4,11 +4,12 @@
 #include <fstream> // for ifstream
 #include <iostream>
 #include <limits>
-#include <queue>
 #include <string>
 #include <unistd.h> // for fsync()
 #include <utility>
 #include <vector>
+
+#include "lockfree_queue.hh"
 
 constexpr unsigned long long operator"" _KB(unsigned long long num)
 {
