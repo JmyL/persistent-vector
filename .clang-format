@@ -1,9 +1,8 @@
 BasedOnStyle: LLVM
-BreakBeforeBraces: Allman  # 여는 괄호를 다음 줄로 내림
-PointerAlignment: Left  # 포인터 기호를 타입이 아닌 변수명에 붙임
+BreakBeforeBraces: Allman
+PointerAlignment: Left
 IndentWidth: 4
-ColumnLimit: 0  # 줄 길이에 제한을 두지 않음
 AccessModifierOffset: -4
-IndentPPDirectives: None  # 매크로는 들여쓰지 않음
+IndentPPDirectives: None
 BraceWrapping:
-  AfterControlStatement: false  # 매크로 및 조건문에서 {를 내리지 않음
+  AfterControlStatement: false
