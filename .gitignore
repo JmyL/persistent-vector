@@ -2,3 +2,6 @@ test
 *.un~
 Debug/
 Release/
+.cache/
+compile_commands.json
+data_dir/
