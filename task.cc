@@ -103,8 +103,7 @@ public:
         m_bg_thread = std::jthread(
             [this](std::stop_token stoken)
             {
-                std::mutex mtx;
-                std::unique_lock lock(mtx);
+                std::unique_lock lock(m_mtx);
                 while (!stoken.stop_requested())
                 {
                     m_cv.wait_for( //
@@ -115,7 +114,7 @@ public:
                             bool stop_requested = stoken.stop_requested();
                             if (!stop_requested)
                             {
-                                // m_ofs.flush();
+                                m_ofs.flush();
                                 // https://man7.org/linux/man-pages/man2/close.2.html
                                 if (fsync(GetFileDescriptor(m_ofs)))
                                     exit(1);
@@ -124,7 +123,7 @@ public:
                             return stop_requested;
                         });
                     // std::cout << "end" << std::endl;
-                    // m_ofs.flush();
+                    m_ofs.flush();
                     if (fsync(GetFileDescriptor(m_ofs)))
                         exit(1);
                 }
@@ -164,7 +163,7 @@ public:
             auto header = Header{.type = PUSHBACK, .id = id, .dsize = length};
             m_ofs.write(reinterpret_cast<const char*>(&header), sizeof(header));
             m_ofs.write(v.data(), v.size());
-            m_ofs.flush();
+            // m_ofs.flush();
         }
         if ((id & 0x7FF) == 0)
         {
@@ -186,7 +185,7 @@ public:
             std::lock_guard<std::mutex> lock(m_mtx);
             // std::cout << "[erase]" << std::endl;
             auto header = Header{.type = ERASE, .id = it->id, .rindex = index};
-            m_ofs.flush();
+            // m_ofs.flush();
             m_ofs.write(reinterpret_cast<const char*>(&header), sizeof(header));
         }
 
