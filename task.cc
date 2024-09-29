@@ -165,10 +165,7 @@ public:
             m_ofs.write(v.data(), v.size());
             // m_ofs.flush();
         }
-        if ((id & 0x7FF) == 0)
-        {
-            m_cv.notify_all();
-        }
+        periodic_notify(id);
 
         m_data.emplace_back(id, v);
     }
@@ -188,11 +185,7 @@ public:
             // m_ofs.flush();
             m_ofs.write(reinterpret_cast<const char*>(&header), sizeof(header));
         }
-
-        if ((++m_last_id & 0x7FF) == 0)
-        {
-            m_cv.notify_all();
-        }
+        periodic_notify(++m_last_id);
 
         m_data.erase(it);
     }
@@ -212,6 +205,13 @@ private:
     std::condition_variable m_cv;
     std::mutex m_mtx;
 
+    void periodic_notify(uint64_t id)
+    {
+        if ((id & 0xFF) == 0)
+        {
+            m_cv.notify_all();
+        }
+    }
     void load_from_file(std::filesystem::path& filepath)
     {
         auto ifs = std::ifstream(filepath, std::ios::binary);
@@ -362,6 +362,10 @@ void run_test_four(const std::filesystem::path& p)
         CHECK(v.size() == i + 1);
     }
     auto end = std::chrono::system_clock::now();
+    std::cout << std::chrono::duration_cast<std::chrono::milliseconds>(end -
+                                                                       start)
+                     .count()
+              << " ms" << std::endl;
     CHECK((end - start) / 1s < 1);
     CHECK(v.size() == LOOP_COUNT);
 }
