@@ -31,6 +31,7 @@ int GetFileDescriptor(std::filebuf& filebuf)
         int handle() { return _M_file.fd(); }
     };
 
+    // UBSan throw error because of downcasting.
     return static_cast<my_filebuf&>(filebuf).handle();
 }
 
@@ -82,19 +83,20 @@ public:
      */
     vector(const std::filesystem::path& directory) : m_last_id(0)
     {
-        m_filepath = directory / _filename;
+        std::filesystem::path filepath;
+        filepath = directory / _filename;
 
-        if (std::filesystem::exists(m_filepath))
+        if (std::filesystem::exists(filepath))
         {
-            load_from_file(m_filepath);
+            load_from_file(filepath);
         }
 
-        m_ofs.open(m_filepath,
-                   std::ios::out | std::ios::binary | std::ios::app);
+        m_ofs.open(filepath, std::ios::binary | std::ios::app);
+        // m_ofs << std::nounitbuf; //
 
-        if (!m_ofs.is_open())
+        if (!m_ofs)
         {
-            throw std::runtime_error("Failed to open " + m_filepath.string() +
+            throw std::runtime_error("Failed to open " + filepath.string() +
                                      " for reading.");
         }
 
@@ -105,18 +107,33 @@ public:
                 std::unique_lock lock(mtx);
                 while (!stoken.stop_requested())
                 {
-                    cv.wait_for(lock, std::chrono::milliseconds(1000),
-                                [&stoken] { return stoken.stop_requested(); });
-                    m_ofs.flush();
-                    fsync(GetFileDescriptor(m_ofs));
-                    std::cout << "thread..." << std::endl;
+                    m_cv.wait_for( //
+                        lock, std::chrono::milliseconds(1000),
+                        [&]
+                        {
+                            // std::cout << "lambda start" << std::endl;
+                            bool stop_requested = stoken.stop_requested();
+                            if (!stop_requested)
+                            {
+                                // m_ofs.flush();
+                                // https://man7.org/linux/man-pages/man2/close.2.html
+                                if (fsync(GetFileDescriptor(m_ofs)))
+                                    exit(1);
+                            }
+                            // std::cout << "lambda end" << std::endl;
+                            return stop_requested;
+                        });
+                    // std::cout << "end" << std::endl;
+                    // m_ofs.flush();
+                    if (fsync(GetFileDescriptor(m_ofs)))
+                        exit(1);
                 }
             });
     }
     ~vector()
     {
         m_bg_thread.request_stop();
-        cv.notify_all();
+        m_cv.notify_all();
         m_bg_thread.join();
     }
 
@@ -142,9 +159,16 @@ public:
         assert(length <= 4_KB);
         {
             std::lock_guard<std::mutex> lock(m_mtx);
+            // std::cout << "[push_back]" << std::endl;
+
             auto header = Header{.type = PUSHBACK, .id = id, .dsize = length};
             m_ofs.write(reinterpret_cast<const char*>(&header), sizeof(header));
-            m_ofs << v;
+            m_ofs.write(v.data(), v.size());
+            m_ofs.flush();
+        }
+        if ((id & 0x7FF) == 0)
+        {
+            m_cv.notify_all();
         }
 
         m_data.emplace_back(id, v);
@@ -160,8 +184,15 @@ public:
         auto it = m_data.begin() + index;
         {
             std::lock_guard<std::mutex> lock(m_mtx);
+            // std::cout << "[erase]" << std::endl;
             auto header = Header{.type = ERASE, .id = it->id, .rindex = index};
+            m_ofs.flush();
             m_ofs.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        }
+
+        if ((++m_last_id & 0x7FF) == 0)
+        {
+            m_cv.notify_all();
         }
 
         m_data.erase(it);
@@ -174,29 +205,28 @@ private:
     static constexpr uint64_t ERASE = 2;
     inline static constexpr const char* _filename = ".vector.bin";
     std::vector<Item> m_data;
-    std::filesystem::path m_filepath;
     std::ofstream m_ofs;
     std::uint64_t m_last_id;
+
+    // Background thread
     std::jthread m_bg_thread;
-    std::condition_variable cv;
+    std::condition_variable m_cv;
     std::mutex m_mtx;
 
-    void load_from_file(std::filesystem::path& m_filepath)
+    void load_from_file(std::filesystem::path& filepath)
     {
-        auto _infile = std::ifstream(m_filepath, std::ios::binary);
-        if (!_infile)
+        auto ifs = std::ifstream(filepath, std::ios::binary);
+        if (!ifs)
         {
-            throw std::runtime_error("Failed to open " + m_filepath.string() +
+            throw std::runtime_error("Failed to open " + filepath.string() +
                                      " for reading.");
         }
-        // TODO:load file to internal vector, m_last_id.
-        // If the file has an error, stop conversion and remove
-        // corrupted information.
+        // Stop loading if file has an error
         while (true)
         {
             Header header;
-            _infile.read(reinterpret_cast<char*>(&header), sizeof(header));
-            if (_infile.eof())
+            ifs.read(reinterpret_cast<char*>(&header), sizeof(header));
+            if (!ifs)
                 break;
 
             if (header.type == ERASE)
@@ -208,14 +238,12 @@ private:
             {
                 auto str = std::string();
                 str.resize(header.dsize);
-                _infile.read(reinterpret_cast<char*>(str.data()), header.dsize);
-                if (_infile.eof())
+                ifs.read(str.data(), header.dsize);
+                if (!ifs)
                     break;
 
                 m_data.emplace_back(header.id, str);
             }
-
-            _infile.close();
         }
     }
 };
@@ -250,6 +278,12 @@ std::string all_chars()
     return rv;
 }
 
+std::string chars_4K(char v)
+{
+    std::string rv(4_KB, v);
+    return rv;
+}
+
 void run_test_one(const std::filesystem::path& p)
 {
     vector v(p);
@@ -271,9 +305,12 @@ void run_test_one(const std::filesystem::path& p)
         v.push_back(s.str());
     }
     auto end = std::chrono::system_clock::now();
+    std::cout << std::chrono::duration_cast<std::chrono::milliseconds>(end -
+                                                                       start)
+                     .count()
+              << " ms" << std::endl;
     CHECK((end - start) / 1s < 1);
     CHECK(v.size() == LOOP_COUNT + 2);
-    std::this_thread::sleep_for(1s);
 }
 
 void run_test_two(const std::filesystem::path& p)
@@ -308,6 +345,28 @@ void run_test_three(const std::filesystem::path& p)
     CHECK(v.at(873) == "loop 873");
 }
 
+void run_test_four(const std::filesystem::path& p)
+{
+    vector v(p);
+    using namespace std::literals;
+
+    while (auto i = v.size())
+    {
+        v.erase(i - 1);
+    }
+
+    auto start = std::chrono::system_clock::now();
+    for (auto i = 0u; i < LOOP_COUNT; ++i)
+    {
+        v.push_back(chars_4K(i));
+        CHECK(v.at(i) == chars_4K(i));
+        CHECK(v.size() == i + 1);
+    }
+    auto end = std::chrono::system_clock::now();
+    CHECK((end - start) / 1s < 1);
+    CHECK(v.size() == LOOP_COUNT);
+}
+
 int main(int argc, char**)
 {
     std::filesystem::path data_dir("data_dir");
@@ -333,6 +392,7 @@ int main(int argc, char**)
     run_test_one(data_dir);
     run_test_two(data_dir);
     run_test_three(data_dir);
+    run_test_four(data_dir);
 
     if (errors != 0)
     {

@@ -31,6 +31,8 @@ You may assume that:
 
 ## Design
 
+### Binary File
+
 Store data as a binary log file with the format below.
 
 `push_back` command:
@@ -50,3 +52,9 @@ Store data as a binary log file with the format below.
 4. RIndex: Index to be removed.
 4. Pad: Automatically added to align the next packet to an 8-byte boundary.
 
+### Calling `fsync`
+
+We can rely on the background process pdflush, but it flushes every modified
+kernel buffer at a fixed time interval of 30 seconds.
+
+I added a background thread to manage a backup file by myself.
