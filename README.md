@@ -65,7 +65,9 @@ I added a background thread to manage a backup file by myself.
 
 # New Design using `io_uring`, `DIRECT_IO` and `coroutines`
 
-With `io_uring` and `DIRECT_IO`, file I/O could be as fast as on a bare-metal machine. Furthermore, repeatedly calling fsync is not a proper solution for fsync failure. We should be aware of the packet we wrote and repeat it, or write it somewhere else if the problem is physical issue.
+With `io_uring` and `DIRECT_IO`, file I/O could be as fast as on a bare-metal machine.
+Furthermore, repeatedly calling fsync is not a proper solution for fsync failure.
+We should be aware of the packet we wrote and repeat it, or write it somewhere else if the problem is physical issue.
 
 ## Experiment: using `io_uring`
 
@@ -310,9 +312,6 @@ BM_uring/4/1/real_time       **1889 ms**        126 ms            1
 -------------------------------------------------------------------
 ```
 
-If I handle requests with multiple threads, I expect that we will see better
-results and the optimal value of y would be greater than 1.
-
 ### Conclusion
 
 Wenn it comes to using `io_uring`, there are three important things to be aware of.
@@ -334,11 +333,11 @@ Coroutines can easily handle all sorts of batching multiple API calls and checki
 4. Every API call creates a coroutine named `batch` if one does not already exist.
 5. Every API call resumes the `batch` coroutine. Information should be sent by the `resume()` interface of the coroutine. The coroutine appends its request to the memory chunk.
 6. If the batch reaches the size limit, it should be submitted with `io_uring` and *moved* to the `coroutine_queue`, so `batch_coroutine` should be well emptied.
-7. A thread pool will inspect the `coroutine_queue`. If it is not empty, threads will take coroutines and resume those.
+7. A background thread will inspect the `coroutine_queue`. If it is not empty, threads will take coroutines and resume those.
 8. The completion queue will be in order for a single submission due to the `IQSQE_IO_HARDLINK_BIT`. We can also wait for the completion of the write request and the subsequent fsync request.
 9. Check if the request is handled properly with the response and retry if necessary. Write request must return its written byte information on its response in completion queue. FSYNC request will give us 0 as its response if everything goes well. The coroutine knows which packet it tried to write. This 'rewriting' must not be disturbed by other request submissions to guarantee reliability.
-10. If a coroutine finishes its task, it should be removed from the `coroutine_queue` on the background thread. The completion may happen in the order of submissions, but I need to confirm this through experimentation. Otherwise, just removing it could lead to problems.
-11. Threads in thread pool should check the `batch_coroutine` if there are no more requests for a certain amount of time (e.g. 1, 10msec).
+10. If a coroutine finishes its task, it should be removed from the `coroutine_queue` on the background thread.
+11. Thread should check the `batch_coroutine` if there are no more requests for a certain amount of time (e.g. 1, 10msec).
 12. Every queue access should be mutually protected with a mutex.
 
 With this design, we can defer every request with `coroutine_queue` and handle the failure of every submission appropriately.
